@@ -8,10 +8,13 @@ import type { Cover } from '@/types/cover'
 import type { PostalRoute } from '@/types/route'
 import type { StamplessEntry } from '@/types/stampentry'
 import type { AssetOwnerType, AssetSide, CatalogAsset } from '@/types/asset'
+import type { PostmarkMergeBatch } from '@/types/merge'
+import { detectDuplicateAssociations, dedupeIds } from '@/utils/merge'
+import { nowIso } from '@/utils/id'
 
 export const DB_NAME = 'gbpostmark'
 /** 当前数据结构版本号，升级迁移写在下面对应的 version() 中 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export class GbPostmarkDatabase extends Dexie {
   postmarks!: Table<Postmark, number>
@@ -20,6 +23,8 @@ export class GbPostmarkDatabase extends Dexie {
   stampEntries!: Table<StamplessEntry, number>
   /** 戳样 / 封图原图，单独建表 */
   assets!: Table<CatalogAsset, number>
+  /** 邮戳合并批次（含失败待重试） */
+  mergeBatches!: Table<PostmarkMergeBatch, number>
 
   constructor() {
     super(DB_NAME)
@@ -34,7 +39,7 @@ export class GbPostmarkDatabase extends Dexie {
     })
 
     // v2：原图拆到 assets 表单独存放，并补齐历史记录缺省字段（升级迁移）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         postmarks:
           '++id, pmNo, type, office, province, yearFrom, yearTo, scarceLevel, inkColor, bilingual',
@@ -72,6 +77,49 @@ export class GbPostmarkDatabase extends Dexie {
             if (!Array.isArray(rt.nodes)) rt.nodes = []
             if (typeof rt.totalDays !== 'number') rt.totalDays = 0
           })
+      })
+
+    // v3：新增邮戳合并批次表；升级时去重封关联，并把重复关联列入同一处理清单
+    this.version(DB_VERSION)
+      .stores({
+        postmarks:
+          '++id, pmNo, type, office, province, yearFrom, yearTo, scarceLevel, inkColor, bilingual',
+        covers:
+          '++id, coverNo, sentFrom, sentTo, postDate, conditionGrade, registered, routeId, acquireFrom',
+        routes: '++id, routeNo, name, era, transport, totalDays',
+        stampEntries: '++id, coverId, stampName, variety, issueYear',
+        assets: '++id, ownerType, ownerId, side, [ownerType+ownerId]',
+        mergeBatches: '++id, masterId, secondaryId, status, createdAt'
+      })
+      .upgrade(async (tx) => {
+        // 封关联去重：同一封上重复引用同一邮戳时只保留一次
+        await tx
+          .table('covers')
+          .toCollection()
+          .modify((cv: Partial<Cover>) => {
+            if (Array.isArray(cv.cancelPmIds)) cv.cancelPmIds = dedupeIds(cv.cancelPmIds)
+          })
+
+        // 检测重复关联：一枚封同时引用了两枚疑似重复的邮戳 → 列入处理清单
+        const postmarks = (await tx.table('postmarks').toArray()) as Postmark[]
+        const covers = (await tx.table('covers').toArray()) as Cover[]
+        const candidates = detectDuplicateAssociations(postmarks, covers)
+        if (candidates.length) {
+          const now = nowIso()
+          const batches: PostmarkMergeBatch[] = candidates.map((c) => ({
+            masterId: c.master.id!,
+            secondaryId: c.secondary.id!,
+            masterSnapshot: { ...c.master, lettering: { ...c.master.lettering } },
+            secondarySnapshot: { ...c.secondary, lettering: { ...c.secondary.lettering } },
+            fieldChoices: {},
+            resolved: { ...c.master, lettering: { ...c.master.lettering }, updatedAt: now },
+            affectedCoverIds: c.affectedCoverIds,
+            status: 'pending',
+            createdAt: now,
+            updatedAt: now
+          }))
+          await tx.table('mergeBatches').bulkAdd(batches)
+        }
       })
   }
 }

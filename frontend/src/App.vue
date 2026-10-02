@@ -2,6 +2,7 @@
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCoverStore } from '@/stores/coverStore'
+import { useMergeStore } from '@/stores/mergeStore'
 import { usePostmarkStore } from '@/stores/postmarkStore'
 import { useRouteStore } from '@/stores/routeStore'
 
@@ -10,6 +11,7 @@ const router = useRouter()
 const postmarkStore = usePostmarkStore()
 const coverStore = useCoverStore()
 const routeStore = useRouteStore()
+const mergeStore = useMergeStore()
 
 const activeMenu = computed(() => {
   const path = current.path
@@ -35,7 +37,12 @@ const routeOptions = computed(() =>
 )
 
 onMounted(async () => {
-  await Promise.all([postmarkStore.load(), coverStore.load(), routeStore.load()])
+  await Promise.all([
+    postmarkStore.load(),
+    coverStore.load(),
+    routeStore.load(),
+    mergeStore.load()
+  ])
 })
 </script>
 
@@ -50,7 +57,15 @@ onMounted(async () => {
         </span>
       </div>
       <el-menu :default-active="activeMenu" mode="horizontal" router :ellipsis="false" class="app-nav">
-        <el-menu-item index="/postmarks">邮戳目录</el-menu-item>
+        <el-menu-item index="/postmarks">
+          邮戳目录
+          <el-badge
+            v-if="mergeStore.pendingCount"
+            :value="mergeStore.pendingCount"
+            class="app-nav__badge"
+            type="danger"
+          />
+        </el-menu-item>
         <el-menu-item index="/covers">实寄封目录</el-menu-item>
         <el-menu-item index="/search">综合检索</el-menu-item>
       </el-menu>
@@ -123,6 +138,10 @@ onMounted(async () => {
   border-bottom: none !important;
   flex: 1;
   min-width: 280px;
+}
+.app-nav__badge {
+  margin-left: 6px;
+  margin-top: -8px;
 }
 .app-aside {
   display: flex;

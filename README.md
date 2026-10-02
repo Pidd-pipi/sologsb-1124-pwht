@@ -40,8 +40,11 @@ docker compose down
 | Cover 实寄封 | `frontend/src/types/cover.ts` | 封号、寄出/收件地、寄出/到达日期、贴票构成、关联邮戳、邮路、中转地、给据、品相、来源、购入价、藏册页位 |
 | PostalRoute 邮路 | `frontend/src/types/route.ts` | 邮路号、名称、时期、运输方式、节点数组（局所/到达日期/中转戳）、全程天数、班期、备注 |
 | StamplessEntry 票戳组合 | `frontend/src/types/stampentry.ts` | 所属封、邮票名称、面值、发行年份、齿度、变体、封上位置 |
+| PostmarkMergeBatch 邮戳合并批次 | `frontend/src/types/merge.ts` | 主档/次档快照、冲突字段保留方、合并后字段快照、受影响封、状态（待处理/写入中/已完成/失败待重试） |
 
 另有 `frontend/src/types/asset.ts`：戳样与封的正反面原图在 IndexedDB 中**单独建表**（`assets`）。
+
+邮戳合并：两枚邮戳并排核对戳型、局所、年代与戳样图，冲突字段由操作者逐项决定保留哪边；确认后把实寄封关联转到主档，票戳组合与检索结果按主档显示。写入中途失败保留批次待重试，旧数据升级时发现的重复关联进入同一处理清单。
 
 ## 四、页面与路由
 

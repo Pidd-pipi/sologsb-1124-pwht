@@ -2,11 +2,14 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
+import MergeDialog from '@/components/MergeDialog.vue'
 import StampCard from '@/components/common/StampCard.vue'
 import ScarceTag from '@/components/common/ScarceTag.vue'
 import { useCatalogFilter } from '@/hooks/useCatalogFilter'
+import { useMergeStore } from '@/stores/mergeStore'
 import { usePostmarkStore, type ImagePayload } from '@/stores/postmarkStore'
 import type { Postmark } from '@/types/postmark'
+import type { PostmarkMergeBatch } from '@/types/merge'
 import {
   INK_COLORS,
   POSTMARK_TYPES,
@@ -16,8 +19,10 @@ import {
 } from '@/types/postmark'
 import { clearDraft, draftSavedAt, loadDraft, saveDraft } from '@/utils/draft'
 import { nowIso, toNumber } from '@/utils/id'
+import { COMPARE_FIELDS } from '@/utils/merge'
 
 const store = usePostmarkStore()
+const mergeStore = useMergeStore()
 const source = computed(() => store.list)
 const { filters, filtered, activeCount, reset } = useCatalogFilter<Postmark>('postmark', source)
 
@@ -25,6 +30,10 @@ const viewMode = ref<'wall' | 'list'>('wall')
 const dialogVisible = ref(false)
 const detailVisible = ref(false)
 const sampleVisible = ref(false)
+const mergeDialogVisible = ref(false)
+const presetMasterId = ref<number | null>(null)
+const batchDetailVisible = ref(false)
+const currentBatch = ref<PostmarkMergeBatch | null>(null)
 const current = ref<Postmark | null>(null)
 const sampleText = ref('')
 const imagePayload = ref<ImagePayload | null>(null)
@@ -33,6 +42,7 @@ const form = reactive<Postmark>(createEmptyPostmark())
 
 onMounted(async () => {
   if (!store.loaded) await store.load()
+  if (!mergeStore.loaded) await mergeStore.load()
   draftHint.value = draftSavedAt('postmark')
 })
 
@@ -136,6 +146,80 @@ async function copySample(): Promise<void> {
     ElMessage.info('浏览器未授权剪贴板，请手动选择文本')
   }
 }
+
+function openMerge(): void {
+  presetMasterId.value = null
+  mergeDialogVisible.value = true
+}
+
+function openMergeWith(pm: Postmark): void {
+  presetMasterId.value = pm.id ?? null
+  mergeDialogVisible.value = true
+}
+
+async function retryMerge(batch: PostmarkMergeBatch): Promise<void> {
+  if (batch.id == null) return
+  try {
+    await mergeStore.retry(batch.id)
+    ElMessage.success('合并已重试成功')
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    ElMessage.error(`重试失败：${message}`)
+  }
+}
+
+async function removeMerge(batch: PostmarkMergeBatch): Promise<void> {
+  if (batch.id == null) return
+  await mergeStore.remove(batch.id)
+  ElMessage.success('批次已删除')
+}
+
+async function clearDoneBatches(): Promise<void> {
+  await mergeStore.clearDone()
+  ElMessage.success('已清除已完成批次')
+}
+
+function viewBatch(batch: PostmarkMergeBatch): void {
+  currentBatch.value = batch
+  batchDetailVisible.value = true
+}
+
+function choiceLabel(batch: PostmarkMergeBatch, fieldKey: string): string {
+  const side = batch.fieldChoices?.[fieldKey] ?? 'master'
+  return side === 'master' ? '保留主档' : '保留次档'
+}
+
+function fieldLabel(fieldKey: string): string {
+  const found = COMPARE_FIELDS.find((f) => f.key === fieldKey)
+  return found?.label ?? fieldKey
+}
+
+function pmLabelOf(id: number): string {
+  return store.labelOf(id)
+}
+
+function mergeStatusLabel(status: string): string {
+  const map: Record<string, string> = {
+    pending: '待处理',
+    applying: '写入中',
+    done: '已完成',
+    failed: '失败待重试'
+  }
+  return map[status] ?? status
+}
+
+function mergeStatusType(status: string): '' | 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'done') return 'success'
+  if (status === 'failed') return 'danger'
+  if (status === 'applying') return 'warning'
+  return 'info'
+}
+
+async function onMergeApplied(): Promise<void> {
+  // 合并成功后重新加载邮戳与批次列表，确保封关联与检索结果按主档显示
+  await store.load()
+  await mergeStore.load()
+}
 </script>
 
 <template>
@@ -152,6 +236,7 @@ async function copySample(): Promise<void> {
           <el-radio-button value="wall">图片墙</el-radio-button>
           <el-radio-button value="list">列表</el-radio-button>
         </el-radio-group>
+        <el-button @click="openMerge">合并邮戳</el-button>
         <el-button type="primary" @click="openCreate">新增邮戳</el-button>
       </div>
     </header>
@@ -195,6 +280,74 @@ async function copySample(): Promise<void> {
           <el-button @click="reset">重置筛选</el-button>
         </el-form-item>
       </el-form>
+    </section>
+
+    <section v-if="mergeStore.batches.length" class="gb-panel merge-batches">
+      <h2 class="gb-panel__title">
+        合并处理清单
+        <el-tag
+          v-if="mergeStore.pendingCount"
+          size="small"
+          type="danger"
+          effect="plain"
+          class="merge-batches__badge"
+        >
+          {{ mergeStore.pendingCount }} 项待处理
+        </el-tag>
+        <el-button
+          v-if="mergeStore.batches.some((b) => b.status === 'done')"
+          size="small"
+          link
+          type="info"
+          class="merge-batches__clear"
+          @click="clearDoneBatches"
+        >
+          清除已完成
+        </el-button>
+      </h2>
+      <el-table :data="mergeStore.batches" border stripe size="small">
+        <el-table-column label="主档" min-width="160">
+          <template #default="{ row }">
+            {{ row.masterSnapshot?.pmNo }} {{ row.masterSnapshot?.office }}
+          </template>
+        </el-table-column>
+        <el-table-column label="次档" min-width="160">
+          <template #default="{ row }">
+            {{ row.secondarySnapshot?.pmNo }} {{ row.secondarySnapshot?.office }}
+          </template>
+        </el-table-column>
+        <el-table-column label="受影响封" width="110" align="center">
+          <template #default="{ row }">{{ row.affectedCoverIds?.length ?? 0 }} 封</template>
+        </el-table-column>
+        <el-table-column label="状态" width="110">
+          <template #default="{ row }">
+            <el-tag size="small" :type="mergeStatusType(row.status)" effect="plain">
+              {{ mergeStatusLabel(row.status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="失败原因" min-width="160">
+          <template #default="{ row }">
+            <span v-if="row.status === 'failed'" class="merge-batches__error">{{ row.error }}</span>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="240">
+          <template #default="{ row }">
+            <el-button size="small" link type="primary" @click="viewBatch(row)">查看</el-button>
+            <el-button
+              v-if="row.status === 'failed' || row.status === 'pending'"
+              size="small"
+              link
+              type="primary"
+              @click="retryMerge(row)"
+            >
+              {{ row.status === 'failed' ? '重试' : '应用' }}
+            </el-button>
+            <el-button size="small" link type="danger" @click="removeMerge(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
     </section>
 
     <p v-if="!filtered.length" class="gb-empty">没有符合当前条件的邮戳，试试放宽年代区间或清空戳型。</p>
@@ -376,7 +529,10 @@ async function copySample(): Promise<void> {
           <div><dt>文字</dt><dd>{{ current.bilingual ? '中英双文字' : '单文字' }}</dd></div>
         </dl>
         <p class="postmark-page__note">{{ current.note || '暂无备注' }}</p>
-        <el-button type="primary" plain @click="generateSample(current)">生成戳样条目</el-button>
+        <div class="postmark-page__detail-actions">
+          <el-button type="primary" plain @click="generateSample(current)">生成戳样条目</el-button>
+          <el-button plain @click="openMergeWith(current)">合并此邮戳</el-button>
+        </div>
       </div>
     </el-drawer>
 
@@ -387,6 +543,63 @@ async function copySample(): Promise<void> {
         <el-button type="primary" @click="copySample">复制条目</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="batchDetailVisible" title="合并批次详情" width="620px">
+      <div v-if="currentBatch" class="batch-detail">
+        <div class="batch-detail__sides">
+          <div class="batch-detail__side">
+            <h4>主档（保留）</h4>
+            <p>{{ currentBatch.masterSnapshot?.pmNo }} · {{ currentBatch.masterSnapshot?.office }}</p>
+            <p class="batch-detail__meta">{{ currentBatch.masterSnapshot?.type }} · {{ currentBatch.masterSnapshot?.yearFrom }}-{{ currentBatch.masterSnapshot?.yearTo }}</p>
+          </div>
+          <div class="batch-detail__side">
+            <h4>次档（合并后删除）</h4>
+            <p>{{ currentBatch.secondarySnapshot?.pmNo }} · {{ currentBatch.secondarySnapshot?.office }}</p>
+            <p class="batch-detail__meta">{{ currentBatch.secondarySnapshot?.type }} · {{ currentBatch.secondarySnapshot?.yearFrom }}-{{ currentBatch.secondarySnapshot?.yearTo }}</p>
+          </div>
+        </div>
+
+        <h4 class="batch-detail__section">字段保留方</h4>
+        <el-table :data="Object.keys(currentBatch.fieldChoices || {})" border stripe size="small">
+          <el-table-column label="字段" min-width="140">
+            <template #default="{ row }">{{ fieldLabel(row) }}</template>
+          </el-table-column>
+          <el-table-column label="保留方" min-width="120">
+            <template #default="{ row }">
+              <el-tag size="small" :type="currentBatch.fieldChoices[row] === 'secondary' ? 'warning' : 'success'" effect="plain">
+                {{ choiceLabel(currentBatch, row) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p v-if="!Object.keys(currentBatch.fieldChoices || {}).length" class="batch-detail__empty">
+          无冲突字段，全部保留主档。
+        </p>
+
+        <h4 class="batch-detail__section">受影响实寄封（{{ currentBatch.affectedCoverIds?.length ?? 0 }} 封）</h4>
+        <p class="batch-detail__covers">
+          <span v-for="(id, i) in currentBatch.affectedCoverIds || []" :key="id">
+            {{ pmLabelOf(id) }}<span v-if="i < (currentBatch.affectedCoverIds?.length ?? 0) - 1">、</span>
+          </span>
+        </p>
+
+        <p v-if="currentBatch.status === 'failed'" class="batch-detail__error">
+          失败原因：{{ currentBatch.error }}
+        </p>
+      </div>
+      <template #footer>
+        <el-button @click="batchDetailVisible = false">关闭</el-button>
+        <el-button
+          v-if="currentBatch && (currentBatch.status === 'failed' || currentBatch.status === 'pending')"
+          type="primary"
+          @click="retryMerge(currentBatch); batchDetailVisible = false"
+        >
+          {{ currentBatch.status === 'failed' ? '重试' : '应用' }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <MergeDialog v-model="mergeDialogVisible" :preset-master-id="presetMasterId" @applied="onMergeApplied" />
   </div>
 </template>
 
@@ -420,5 +633,66 @@ async function copySample(): Promise<void> {
   font-size: 13px;
   color: var(--gb-muted);
   line-height: 1.6;
+}
+.postmark-page__detail-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.merge-batches__badge {
+  margin-left: 8px;
+}
+.merge-batches__clear {
+  margin-left: 12px;
+}
+.merge-batches__error {
+  font-size: 12px;
+  color: #b02a1e;
+}
+.batch-detail__sides {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.batch-detail__side {
+  padding: 10px;
+  border: 1px solid var(--gb-line);
+  border-radius: 8px;
+  background: #fffdf8;
+}
+.batch-detail__side h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: #5d3325;
+}
+.batch-detail__side p {
+  margin: 2px 0;
+  font-size: 13px;
+}
+.batch-detail__meta {
+  color: var(--gb-muted);
+  font-size: 12px !important;
+}
+.batch-detail__section {
+  margin: 12px 0 6px;
+  font-size: 14px;
+  color: #5d3325;
+}
+.batch-detail__empty {
+  font-size: 12px;
+  color: var(--gb-muted);
+}
+.batch-detail__covers {
+  font-size: 13px;
+  color: #5d3325;
+}
+.batch-detail__error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #b02a1e;
+  background: #fdf3ef;
+  border-radius: 8px;
 }
 </style>
