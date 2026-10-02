@@ -4,8 +4,12 @@ import { ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import StampCard from '@/components/common/StampCard.vue'
 import ScarceTag from '@/components/common/ScarceTag.vue'
+import PostmarkMergeDialog from '@/components/merge/PostmarkMergeDialog.vue'
+import MergeQueueDrawer from '@/components/merge/MergeQueueDrawer.vue'
 import { useCatalogFilter } from '@/hooks/useCatalogFilter'
 import { usePostmarkStore, type ImagePayload } from '@/stores/postmarkStore'
+import { useCoverStore } from '@/stores/coverStore'
+import { useMergeStore } from '@/stores/mergeStore'
 import type { Postmark } from '@/types/postmark'
 import {
   INK_COLORS,
@@ -18,6 +22,8 @@ import { clearDraft, draftSavedAt, loadDraft, saveDraft } from '@/utils/draft'
 import { nowIso, toNumber } from '@/utils/id'
 
 const store = usePostmarkStore()
+const coverStore = useCoverStore()
+const mergeStore = useMergeStore()
 const source = computed(() => store.list)
 const { filters, filtered, activeCount, reset } = useCatalogFilter<Postmark>('postmark', source)
 
@@ -25,6 +31,10 @@ const viewMode = ref<'wall' | 'list'>('wall')
 const dialogVisible = ref(false)
 const detailVisible = ref(false)
 const sampleVisible = ref(false)
+const mergeDialogVisible = ref(false)
+const queueVisible = ref(false)
+const mergeMasterId = ref<number | null>(null)
+const mergeTaskId = ref<number | null>(null)
 const current = ref<Postmark | null>(null)
 const sampleText = ref('')
 const imagePayload = ref<ImagePayload | null>(null)
@@ -33,8 +43,31 @@ const form = reactive<Postmark>(createEmptyPostmark())
 
 onMounted(async () => {
   if (!store.loaded) await store.load()
+  await mergeStore.load()
   draftHint.value = draftSavedAt('postmark')
 })
+
+/** 合并 / 重试完成后刷新：邮戳主档、实寄封关联、检索结果全部按主档显示 */
+async function refreshAfterMerge(): Promise<void> {
+  await Promise.all([store.load(), coverStore.load(), mergeStore.load()])
+  if (current.value && typeof current.value.id === 'number') {
+    const refreshed = store.byId(current.value.id)
+    if (refreshed) current.value = refreshed
+  }
+  detailVisible.value = false
+}
+
+function openMergeCreate(pm?: Postmark): void {
+  mergeTaskId.value = null
+  mergeMasterId.value = pm && typeof pm.id === 'number' ? pm.id : null
+  mergeDialogVisible.value = true
+}
+
+function openMergeTask(taskId: number): void {
+  mergeMasterId.value = null
+  mergeTaskId.value = taskId
+  mergeDialogVisible.value = true
+}
 
 watch(
   form,
@@ -152,7 +185,11 @@ async function copySample(): Promise<void> {
           <el-radio-button value="wall">图片墙</el-radio-button>
           <el-radio-button value="list">列表</el-radio-button>
         </el-radio-group>
+        <el-badge :value="mergeStore.pendingCount" :hidden="mergeStore.pendingCount === 0" type="danger">
+          <el-button @click="queueVisible = true">合并处理清单</el-button>
+        </el-badge>
         <el-button type="primary" @click="openCreate">新增邮戳</el-button>
+        <el-button type="warning" plain @click="openMergeCreate()">合并邮戳</el-button>
       </div>
     </header>
 
@@ -227,11 +264,14 @@ async function copySample(): Promise<void> {
           <ScarceTag :level="row.scarceLevel" />
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="190">
+      <el-table-column label="操作" width="240">
         <template #default="{ row }">
           <el-button size="small" link type="primary" @click.stop="showDetail(row)">查看</el-button>
           <el-button size="small" link type="primary" @click.stop="generateSample(row)">
             生成戳样条目
+          </el-button>
+          <el-button size="small" link type="warning" @click.stop="openMergeCreate(row)">
+            合并
           </el-button>
         </template>
       </el-table-column>
@@ -376,7 +416,10 @@ async function copySample(): Promise<void> {
           <div><dt>文字</dt><dd>{{ current.bilingual ? '中英双文字' : '单文字' }}</dd></div>
         </dl>
         <p class="postmark-page__note">{{ current.note || '暂无备注' }}</p>
-        <el-button type="primary" plain @click="generateSample(current)">生成戳样条目</el-button>
+        <div class="postmark-page__detail-actions">
+          <el-button type="primary" plain @click="generateSample(current)">生成戳样条目</el-button>
+          <el-button type="warning" plain @click="openMergeCreate(current)">以此条为主档合并</el-button>
+        </div>
       </div>
     </el-drawer>
 
@@ -387,6 +430,18 @@ async function copySample(): Promise<void> {
         <el-button type="primary" @click="copySample">复制条目</el-button>
       </template>
     </el-dialog>
+
+    <PostmarkMergeDialog
+      v-model:visible="mergeDialogVisible"
+      :preselect-master-id="mergeMasterId"
+      :task-id="mergeTaskId"
+      @merged="refreshAfterMerge"
+    />
+    <MergeQueueDrawer
+      v-model:visible="queueVisible"
+      @review="openMergeTask"
+      @changed="refreshAfterMerge"
+    />
   </div>
 </template>
 
@@ -411,6 +466,11 @@ async function copySample(): Promise<void> {
   flex-direction: column;
   gap: 10px;
   align-items: flex-start;
+}
+.postmark-page__detail-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .postmark-page__no-image {
   font-size: 12px;

@@ -4,12 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { useCoverStore } from '@/stores/coverStore'
 import { usePostmarkStore } from '@/stores/postmarkStore'
 import { useRouteStore } from '@/stores/routeStore'
+import { useMergeStore } from '@/stores/mergeStore'
 
 const current = useRoute()
 const router = useRouter()
 const postmarkStore = usePostmarkStore()
 const coverStore = useCoverStore()
 const routeStore = useRouteStore()
+const mergeStore = useMergeStore()
 
 const activeMenu = computed(() => {
   const path = current.path
@@ -35,7 +37,7 @@ const routeOptions = computed(() =>
 )
 
 onMounted(async () => {
-  await Promise.all([postmarkStore.load(), coverStore.load(), routeStore.load()])
+  await Promise.all([postmarkStore.load(), coverStore.load(), routeStore.load(), mergeStore.load()])
 })
 </script>
 

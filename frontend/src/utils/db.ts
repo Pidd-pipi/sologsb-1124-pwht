@@ -8,10 +8,12 @@ import type { Cover } from '@/types/cover'
 import type { PostalRoute } from '@/types/route'
 import type { StamplessEntry } from '@/types/stampentry'
 import type { AssetOwnerType, AssetSide, CatalogAsset } from '@/types/asset'
+import type { MergeTask } from '@/types/merge'
+import { detectDuplicatePostmarks } from '@/utils/mergeFields'
 
 export const DB_NAME = 'gbpostmark'
 /** 当前数据结构版本号，升级迁移写在下面对应的 version() 中 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export class GbPostmarkDatabase extends Dexie {
   postmarks!: Table<Postmark, number>
@@ -20,6 +22,8 @@ export class GbPostmarkDatabase extends Dexie {
   stampEntries!: Table<StamplessEntry, number>
   /** 戳样 / 封图原图，单独建表 */
   assets!: Table<CatalogAsset, number>
+  /** 邮戳合并处理清单：手动批次、写入失败待重试批次、迁移发现的重复关联 */
+  mergeTasks!: Table<MergeTask, number>
 
   constructor() {
     super(DB_NAME)
@@ -72,6 +76,94 @@ export class GbPostmarkDatabase extends Dexie {
             if (!Array.isArray(rt.nodes)) rt.nodes = []
             if (typeof rt.totalDays !== 'number') rt.totalDays = 0
           })
+      })
+
+    // v3：新增合并处理清单；升级时把重复档案、实寄封里的重复邮戳关联写入同一清单
+    this.version(DB_VERSION)
+      .stores({
+        mergeTasks: '++id, batchNo, status, kind, source, masterId, duplicateId, coverId'
+      })
+      .upgrade(async (tx) => {
+        const stamp = new Date().toISOString()
+        const tasks: MergeTask[] = []
+        let seq = 0
+        const nextBatchNo = (): string => {
+          seq += 1
+          return `MG-${String(seq).padStart(4, '0')}`
+        }
+
+        const postmarks = (await tx.table('postmarks').toArray()) as Postmark[]
+        const pmById = new Map<number, Postmark>()
+        for (const pm of postmarks) {
+          if (typeof pm.id === 'number') pmById.set(pm.id, pm)
+        }
+        const pmLabel = (id: number): string => {
+          const pm = pmById.get(id)
+          return pm ? `${pm.pmNo} ${pm.office}` : `#${id}`
+        }
+
+        // 1) 同一实寄封 cancelPmIds 内的重复关联：先做兼容规整（不动数据），再逐条入清单
+        const covers = (await tx.table('covers').toArray()) as Cover[]
+        for (const cover of covers) {
+          if (typeof cover.id !== 'number') continue
+          const seen = new Set<number>()
+          const duplicates = new Set<number>()
+          for (const rawId of cover.cancelPmIds ?? []) {
+            const id = Number(rawId)
+            if (!Number.isFinite(id) || id <= 0) continue
+            if (seen.has(id)) duplicates.add(id)
+            seen.add(id)
+          }
+          if (duplicates.size > 0) {
+            tasks.push({
+              batchNo: nextBatchNo(),
+              kind: 'linkDedup',
+              status: 'pending',
+              source: 'migration',
+              title: `${cover.coverNo} 存在重复邮戳关联`,
+              note: `升级旧数据时发现该封的关联邮戳中 ${Array.from(duplicates)
+                .map(pmLabel)
+                .join('、')} 被重复登记，确认后只保留一处关联。`,
+              createdAt: stamp,
+              updatedAt: stamp,
+              lastError: '',
+              attempts: 0,
+              masterId: 0,
+              duplicateId: 0,
+              snapshot: null,
+              doneSteps: [],
+              coverId: cover.id
+            })
+          }
+        }
+
+        // 2) 疑似重复的邮戳档案：同编目号或同戳型局所且年代重叠，逐对建议合并
+        const groups = detectDuplicatePostmarks(postmarks)
+        for (const group of groups) {
+          for (let i = 0; i < group.ids.length; i += 1) {
+            for (let j = i + 1; j < group.ids.length; j += 1) {
+              tasks.push({
+                batchNo: nextBatchNo(),
+                kind: 'merge',
+                status: 'pending',
+                source: 'migration',
+                title: `疑似重复邮戳：${pmLabel(group.ids[i])} ⇄ ${pmLabel(group.ids[j])}`,
+                note: `升级旧数据时发现（${group.reason}）。请并排核对戳型、局所、年代与戳样图，逐项决定保留内容并指定主档。`,
+                createdAt: stamp,
+                updatedAt: stamp,
+                lastError: '',
+                attempts: 0,
+                masterId: group.ids[i],
+                duplicateId: group.ids[j],
+                snapshot: null,
+                doneSteps: [],
+                coverId: 0
+              })
+            }
+          }
+        }
+
+        if (tasks.length > 0) await tx.table('mergeTasks').bulkAdd(tasks)
       })
   }
 }
